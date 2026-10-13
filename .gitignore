@@ -1,0 +1,28 @@
+# ----- Python / 빌드 결과물 -----
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+*.exe
+
+# ----- 분석 결과 -----
+analysis_result.csv
+result/
+*_result.png
+00_summary.png
+
+# ----- 시퀀싱 데이터 (미발표 연구 데이터 보호) -----
+# 데이터도 올리려면 아래 줄들을 지우거나 앞에 # 를 붙이세요.
+*.ab1
+*.abi
+*.pdf
+R*-*_P*.txt
+Primer_*.txt
+P[0-9].txt
+
+# ----- 기타 -----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

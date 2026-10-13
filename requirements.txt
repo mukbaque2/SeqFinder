@@ -1,0 +1,5 @@
+# 프로그램 실행에 필요
+pillow>=10.0
+
+# exe 만들 때만 필요
+pyinstaller>=6.0
