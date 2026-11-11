@@ -9,6 +9,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 from abi_reader import GOOD_Q
+from alignment_view import build_lines, combined_aa_lines, combined_dna_lines
 
 W = 1800                 # 이미지 폭(px)
 M = 40                   # 좌우 여백
@@ -84,26 +85,54 @@ class _Canvas:
 
 
 # ---------- 파일 하나 ----------
-def _alignment_block(c, r):
-    """찾을 서열 / 일치 표시 / 결과 서열 을 폭에 맞게 나눠서 출력"""
-    # 라벨은 한글 글꼴, 서열은 고정폭 글꼴 (Consolas 에는 한글이 없음)
-    label_w = c.d.textlength("결과 서열", font=F_TEXT) + 16
-    per = int((W - 2 * M - label_w) // c.d.textlength("A", font=F_MONO))
-    q, bar, rd = r["q_aln"], r["bar"], r["r_aln"]
-    for i in range(0, len(q), per):
-        y0 = c.y
-        c.d.rectangle([M - 8, y0 - 4, W - M + 8, y0 + 3 * 26 + 2], fill=(248, 248, 248))
-        for label, s in (("찾을 서열", q), ("", bar), ("결과 서열", rd)):
-            c.d.text((M, c.y - 1), label, font=F_TEXT, fill=(90, 90, 90))
-            x = M + label_w
-            for k, ch in enumerate(s[i:i + per]):
-                col = (20, 20, 20)
-                if q[i + k] != rd[i + k]:
-                    col = (200, 30, 30)
-                c.d.text((x, c.y), ch, font=F_MONO, fill=col)
-                x += c.d.textlength(ch, font=F_MONO)
-            c.y += 26
-        c.space(14)
+# 정렬 줄 스타일: (글꼴, 글자색, 바탕색)
+F_MONO_B = _font(["consolab.ttf", "consola.ttf"], 20)
+F_TEXT_B = _font(["malgunbd.ttf", "malgun.ttf"], 20)
+_STYLE = {
+    "q": (F_MONO, (23, 78, 166), (232, 240, 254)),      # 찾을 서열: 파랑
+    "r": (F_MONO, (19, 115, 51), (230, 244, 234)),      # 결과 서열: 초록
+    "mm": (F_MONO_B, (255, 255, 255), (217, 48, 37)),   # 불일치: 빨간 바탕 흰 글자
+    "ins": (F_MONO_B, (255, 255, 255), (132, 48, 206)),  # 그 뒤에 삽입: 보라 바탕
+    "bar": (F_MONO, (154, 160, 166), None),
+    "mark": (F_MONO_B, (217, 48, 37), None),
+    "num": (F_MONO, (128, 134, 139), None),
+    "head": (F_TEXT_B, (20, 20, 20), None),
+    "note": (F_TEXT, (95, 99, 104), None),
+    "mmtext": (F_TEXT, (217, 48, 37), None),
+    "oktext": (F_TEXT, (19, 115, 51), None),
+    "instext": (F_TEXT, (132, 48, 206), None),
+    "": (F_TEXT, (20, 20, 20), None),
+}
+_LABEL_COLOR = {"q": (23, 78, 166), "r": (19, 115, 51)}
+
+
+def _alignment_block(c, lines):
+    """
+    alignment_view.build_lines 의 줄 목록을 그림.
+    왼쪽 = 서열이 나온 파일 이름, 오른쪽 = 색칠된 서열 (불일치는 빨간 바탕)
+    """
+    label_w = max([c.d.textlength(l["label"], font=F_TEXT_B) for l in lines if l.get("label")] or [0]) + 24
+    x0 = M + label_w
+    line_h = 28
+    for l in lines:
+        if not l["cells"] and not l.get("label"):
+            c.y += 10
+            continue
+        if l.get("label"):
+            c.d.text((M, c.y - 2), l["label"], font=F_TEXT_B, fill=_LABEL_COLOR.get(l.get("label_tag"), (60, 60, 60)))
+        x = x0
+        for text, tag in l["cells"]:
+            font, fg, bg = _STYLE.get(tag, _STYLE[""])
+            for ch in text:
+                w = c.d.textlength(ch, font=font)
+                if x + w > W - M:          # 긴 설명은 서열 시작 위치에서 줄바꿈
+                    x = x0
+                    c.y += line_h
+                if bg and ch != " ":
+                    c.d.rectangle([x, c.y, x + w, c.y + line_h - 2], fill=bg)
+                c.d.text((x, c.y + 2), ch, font=font, fill=fg)
+                x += w
+        c.y += line_h
 
 
 def _overview(c, tr, q, r):
@@ -130,15 +159,16 @@ def _overview(c, tr, q, r):
     c.y += h + 20
 
 
-def _chromatogram(c, tr, r):
-    """찾은 위치 주변 크로마토그램 (BASES_PER_ROW 염기씩 여러 줄)"""
-    c.text("크로마토그램  (연한 주황 = 찾은 서열 구간, 노랑 = 차이 있는 염기, 아래 막대 = 품질 Q, 빨간 점선 = Q20)",
-           F_SMALL, (80, 80, 80), gap=4)
+def _chromatogram(c, tr, r, compact=False):
+    """찾은 위치 주변 크로마토그램 (BASES_PER_ROW 염기씩 여러 줄). compact=True 면 높이를 줄여서 그림"""
+    if not compact:
+        c.text("크로마토그램  (연한 주황 = 찾은 서열 구간, 노랑 = 차이 있는 염기, 아래 막대 = 품질 Q, 빨간 점선 = Q20)",
+               F_SMALL, (80, 80, 80), gap=4)
     s_all = max(1, r["start"] - FLANK)
     e_all = min(len(tr), r["end"] + FLANK)
     diff_pos = set(r.get("diff_pos", []))
-    trace_h, base_gap, qbar_h = 170, 26, 60
-    row_h = 22 + trace_h + base_gap + qbar_h + 30
+    trace_h, base_gap, qbar_h = (110, 26, 36) if compact else (170, 26, 60)
+    row_h = 22 + trace_h + base_gap + qbar_h + (16 if compact else 30)
     # 줄 수를 정한 뒤 염기를 줄마다 고르게 나눔 (예: 67개 -> 1줄, 160개 -> 2줄 x 80)
     total = e_all - s_all + 1
     n_rows = -(-total // BASES_PER_ROW)
@@ -151,13 +181,15 @@ def _chromatogram(c, tr, r):
         e = min(e_all, s + per_row - 1)
         y0 = c.y
         x_lo = tr.ploc[s - 1] - 8
-        X = lambda scan: M + (scan - x_lo) * px
         x_hi = tr.ploc[e - 1] + 8
+        # 피크 간격이 평소보다 넓은 줄은 폭을 넘지 않게 그 줄만 조금 줄임
+        row_px = min(px, (W - 2 * M) / max(x_hi - x_lo, 1))
+        X = lambda scan, px=row_px: M + (scan - x_lo) * px
         top = y0 + 22
         # 배경
         for i in range(s, e + 1):
             xm = X(tr.ploc[i - 1])
-            half = 9 * px if px < 1.5 else 7 * px
+            half = 9 * row_px if row_px < 1.5 else 7 * row_px
             if i in diff_pos:
                 c.d.rectangle([xm - half, top, xm + half, top + trace_h + base_gap + qbar_h], fill=(255, 224, 102))
             elif r["start"] <= i <= r["end"]:
@@ -185,11 +217,11 @@ def _chromatogram(c, tr, r):
         c.y = y0 + row_h
 
 
-def render_report(f, r, query):
-    """파일 하나의 결과 이미지 (PIL.Image)"""
+def render_report(f, r, query, query_name="찾을 서열", frame_setting="자동"):
+    """파일 하나의 결과 이미지 (PIL.Image). query_name = 찾을 서열이 나온 파일 이름"""
     c = _Canvas()
     c.text(f"{Path(f).name}", F_TITLE, gap=10)
-    c.text(f"찾을 서열 ({len(query)} bp): {query}", F_SMALL, (90, 90, 90))
+    c.text(f"찾을 서열: {query_name} ({len(query)} bp)  {query}", F_SMALL, (90, 90, 90))
     c.text(f"분석: {datetime.now():%Y-%m-%d %H:%M}   ·   시퀀싱 서열 검색기", F_SMALL, (140, 140, 140))
     c.space(6)
     c.rule()
@@ -208,9 +240,10 @@ def render_report(f, r, query):
     c.text(line, F_TEXT, bg=bg, gap=14)
 
     if found:
-        _alignment_block(c, r)
+        lines, _ = build_lines(r, query, r["read"], query_name, Path(f).name, frame_setting)
+        _alignment_block(c, lines)
         if r.get("diff_notes") or r["diffs"]:
-            c.text("차이: " + "; ".join(r.get("diff_notes") or r["diffs"]), F_TEXT, (160, 30, 30))
+            c.text("DNA 차이: " + "; ".join(r.get("diff_notes") or r["diffs"]), F_TEXT, (160, 30, 30))
     q = r.get("qual")
     if q:
         clean = f"{q['clean'][0]}-{q['clean'][1]}" if q["clean"] else "-"
@@ -232,15 +265,8 @@ def render_report(f, r, query):
 
 
 # ---------- 요약 표 ----------
-def render_summary(results, query):
-    """results: {파일경로: 결과 dict} -> 요약 표 이미지"""
-    c = _Canvas()
-    c.text("시퀀싱 분석 결과 요약", F_TITLE, gap=10)
-    c.text(f"찾을 서열 ({len(query)} bp): {query}", F_SMALL, (90, 90, 90))
-    ok = sum(r["verdict"] == "일치" for r in results.values())
-    c.text(f"분석: {datetime.now():%Y-%m-%d %H:%M}   ·   {len(results)}개 중 일치 {ok}개", F_SMALL, (140, 140, 140))
-    c.space(8)
-
+def _summary_table(c, results):
+    """결과 요약 표 (파일마다 한 줄)"""
     cols = [("파일", 260), ("판정", 110), ("위치", 140), ("찾은 부위 품질", 220),
             ("깨끗한 구간", 160), ("전체 품질", 120), ("차이 / 품질 설명", W - 2 * M - 1010)]
     row_pad = 10
@@ -276,4 +302,55 @@ def render_summary(results, query):
         row([Path(f).name, r["verdict"], pos, r.get("site_label", "-") if found else "",
              clean, q["grade"] if q else "-", detail],
             VERDICT_BG.get(r["verdict"], DIFF_BG))
+
+
+def _header(c, title, results, query, query_name):
+    c.text(title, F_TITLE, gap=10)
+    c.text(f"찾을 서열: {query_name} ({len(query)} bp)  {query}", F_SMALL, (90, 90, 90))
+    ok = sum(r["verdict"] == "일치" for r in results.values())
+    c.text(f"분석: {datetime.now():%Y-%m-%d %H:%M}   ·   {len(results)}개 중 일치 {ok}개   ·   시퀀싱 서열 검색기",
+           F_SMALL, (140, 140, 140))
+    c.space(8)
+
+
+def render_summary(results, query, query_name="찾을 서열"):
+    """results: {파일경로: 결과 dict} -> 요약 표 이미지"""
+    c = _Canvas()
+    _header(c, "시퀀싱 분석 결과 요약", results, query, query_name)
+    _summary_table(c, results)
     return c.finish()
+
+
+def render_overview(results, query, query_name="찾을 서열", frame_setting="자동"):
+    """
+    모아보기: 요약 표 + 모든 파일의 DNA/아미노산 정렬을 한 표에 + 파일별 크로마토그램
+    """
+    c = _Canvas(max_h=60000)
+    _header(c, "시퀀싱 결과 모아보기", results, query, query_name)
+    _summary_table(c, results)
+    c.space(24)
+    c.rule()
+    _alignment_block(c, combined_dna_lines(results, query, query_name))
+    c.space(10)
+    _alignment_block(c, combined_aa_lines(results, query, query_name, frame_setting))
+    with_trace = [(f, r) for f, r in results.items()
+                  if r.get("trace") is not None and r["verdict"] not in ("없음", "오류")]
+    if with_trace:
+        c.space(10)
+        c.rule()
+        c.text("크로마토그램 모아보기  (연한 주황 = 찾은 서열 구간, 노랑 = 차이 있는 염기, 아래 막대 = 품질 Q, 빨간 점선 = Q20)",
+               F_TEXT_B, gap=10)
+        for f, r in with_trace:
+            c.text(f"{Path(f).name}   ·   {r['verdict']}   ·   위치 {r['start']}-{r['end']}"
+                   + (f"   ·   찾은 부위 품질 {r['site_label']}" if r.get("site_label") else ""),
+                   F_TEXT, bg=VERDICT_BG.get(r["verdict"], DIFF_BG), gap=4)
+            _chromatogram(c, r["trace"], r, compact=True)
+            c.space(6)
+    return c.finish()
+
+
+def export_pdf(path, results, query, query_name="찾을 서열", frame_setting="자동"):
+    """PDF 한 파일: 1쪽 = 모아보기, 이후 = 파일별 상세"""
+    pages = [render_overview(results, query, query_name, frame_setting)]
+    pages += [render_report(f, r, query, query_name, frame_setting) for f, r in results.items()]
+    pages[0].save(path, "PDF", resolution=150, save_all=True, append_images=pages[1:])

@@ -7,12 +7,16 @@
 import csv
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from abi_reader import GOOD_LEN, GOOD_Q, Trace, suspicious_reason, weakest_in_run
+from alignment_view import aa_compare, build_lines, frame_note
 from analyze_seq import analyze_one, clean_seq, read_seq
-from report_image import render_report, render_summary
+from PIL import ImageTk
+
+from report_image import export_pdf, render_overview, render_report, render_summary
 
 SEQ_FILETYPES = [("시퀀싱 파일", "*.ab1 *.abi *.txt *.seq *.fasta *.fa *.fas"),
                  ("ab1 원본", "*.ab1 *.abi"), ("모든 파일", "*.*")]
@@ -26,11 +30,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("시퀀싱 서열 검색기")
-        self.geometry("1100x840")
+        self.geometry("1100x880")
         self.minsize(820, 680)
         self.files = []      # 추가된 파일 경로
         self.results = {}    # 파일 경로 -> 분석 결과 dict
         self.last_query = ""
+        self.last_query_name = "찾을 서열"
+        self.query_source = None   # 파일에서 불러온 찾을 서열 (파일 이름, 서열)
 
         mono = ("Consolas", 10)
         pad = {"padx": 8, "pady": 3}
@@ -65,6 +71,12 @@ class App(tk.Tk):
         ttk.Label(bar, text="허용 차이 비율(%)").pack(side="left")
         self.ratio_var = tk.IntVar(value=20)
         ttk.Spinbox(bar, from_=0, to=50, width=5, textvariable=self.ratio_var).pack(side="left", padx=(4, 16))
+        ttk.Label(bar, text="아미노산 읽는 틀").pack(side="left")
+        self.frame_var = tk.StringVar(value="자동")
+        frame_box = ttk.Combobox(bar, textvariable=self.frame_var, values=["자동", "1", "2", "3"],
+                                 width=5, state="readonly")
+        frame_box.pack(side="left", padx=(4, 16))
+        frame_box.bind("<<ComboboxSelected>>", lambda e: self.show_detail())
         self.run_btn = ttk.Button(bar, text="▶ 분석 시작", command=self.run_analysis)
         self.run_btn.pack(side="left")
         self.save_btn = ttk.Button(bar, text="CSV로 저장", command=self.save_csv, state="disabled")
@@ -73,6 +85,8 @@ class App(tk.Tk):
         self.img_btn.pack(side="left", padx=4)
         self.img_all_btn = ttk.Button(bar, text="전체 이미지 저장", command=self.save_all_images, state="disabled")
         self.img_all_btn.pack(side="left", padx=4)
+        self.overview_btn = ttk.Button(bar, text="▦ 결과 모아보기", command=self.open_overview, state="disabled")
+        self.overview_btn.pack(side="left", padx=4)
         self.progress = ttk.Progressbar(bar, mode="determinate", length=160)
         self.progress.pack(side="right")
         self.status_var = tk.StringVar(value="찾을 서열을 입력하고 파일을 추가하세요.")
@@ -82,7 +96,7 @@ class App(tk.Tk):
         box4 = ttk.LabelFrame(self, text=" 3. 결과 (행을 클릭하면 아래에 정렬과 크로마토그램이 표시됩니다) ")
         box4.pack(fill="both", expand=True, **pad)
         cols = ("file", "verdict", "pos", "site_q", "clean", "grade", "detail")
-        self.tree = ttk.Treeview(box4, columns=cols, show="headings", height=6)
+        self.tree = ttk.Treeview(box4, columns=cols, show="headings", height=5)
         for c, title, w, anchor in [
                 ("file", "파일", 150, "w"), ("verdict", "판정", 70, "center"),
                 ("pos", "위치", 80, "center"), ("site_q", "찾은 부위 품질", 110, "center"),
@@ -95,8 +109,17 @@ class App(tk.Tk):
         self.tree.pack(fill="both", expand=True, padx=8, pady=(6, 4))
         self.tree.bind("<<TreeviewSelect>>", self.show_detail)
 
-        self.detail = tk.Text(box4, height=7, font=mono, wrap="none", state="disabled", background="#fafafa")
-        self.detail.pack(fill="x", padx=8)
+        detail_frame = ttk.Frame(box4)
+        detail_frame.pack(fill="x", padx=8)
+        self.detail = tk.Text(detail_frame, height=12, font=mono, wrap="none", state="disabled",
+                              background="#fafafa")
+        dy = ttk.Scrollbar(detail_frame, orient="vertical", command=self.detail.yview)
+        dx = ttk.Scrollbar(detail_frame, orient="horizontal", command=self.detail.xview)
+        self.detail.configure(yscrollcommand=dy.set, xscrollcommand=dx.set)
+        dy.pack(side="right", fill="y")
+        self.detail.pack(fill="x")
+        dx.pack(fill="x")
+        self._setup_detail_tags(mono)
 
         # 전체 품질 막대 (판독 전체에서 깨끗한 구간 / 찾은 위치)
         ttk.Label(box4, text="전체 품질 (회색 막대 = 염기별 품질, 초록 = 깨끗한 구간, 주황 = 찾은 위치)").pack(anchor="w", padx=8, pady=(6, 0))
@@ -127,8 +150,10 @@ class App(tk.Tk):
     def load_query_file(self):
         path = filedialog.askopenfilename(title="찾을 서열 파일 선택", filetypes=QUERY_FILETYPES)
         if path:
+            seq = read_seq(path)
             self.seq_text.delete("1.0", "end")
-            self.seq_text.insert("1.0", read_seq(path))
+            self.seq_text.insert("1.0", seq)
+            self.query_source = (Path(path).name, seq)
 
     def add_files(self):
         paths = filedialog.askopenfilenames(title="시퀀싱 결과 파일 선택", filetypes=SEQ_FILETYPES)
@@ -170,9 +195,13 @@ class App(tk.Tk):
 
         self.tree.delete(*self.tree.get_children())
         self.results.clear()
+        self.last_query = query
+        # 파일에서 불러온 서열을 그대로 쓰면 그 파일 이름, 직접 입력·수정했으면 '입력한 서열'
+        src = self.query_source
+        self.last_query_name = src[0] if src and src[1] == query else "입력한 서열"
         self._clear_detail()
         self.run_btn.configure(state="disabled")
-        for b in (self.save_btn, self.img_btn, self.img_all_btn):
+        for b in (self.save_btn, self.img_btn, self.img_all_btn, self.overview_btn):
             b.configure(state="disabled")
         self.progress.configure(maximum=len(self.files), value=0)
         self.status_var.set("분석 중...")
@@ -189,6 +218,7 @@ class App(tk.Tk):
             read = read_seq(f)
         r = analyze_one(query, read, ratio)
         r["read_len"] = len(read)
+        r["read"] = read
         r["trace"] = trace
         if trace is None:
             return r
@@ -250,7 +280,7 @@ class App(tk.Tk):
         ok = sum(r["verdict"] == "일치" for r in self.results.values())
         self.status_var.set(f"완료: {n}개 중 일치 {ok}개 (찾을 서열 {len(query)} bp)")
         self.run_btn.configure(state="normal")
-        for b in (self.save_btn, self.img_btn, self.img_all_btn):
+        for b in (self.save_btn, self.img_btn, self.img_all_btn, self.overview_btn):
             b.configure(state="normal")
         self.last_query = query
 
@@ -271,34 +301,79 @@ class App(tk.Tk):
             self._set_detail(r.get("error", "") if r else "")
             return
         found = r["verdict"] != "없음"
-        text = f'{f.name}  (결과 서열 {r["read_len"]} bp)\n'
+        lines = [self._plain(f'{f.name}  (결과 서열 {r["read_len"]} bp)', "head")]
         if found:
-            text += (f'판정: {r["verdict"]}  |  방향: {r["strand"]}  |  위치: {r["start"]}-{r["end"]}\n'
-                     f'찾을 서열 {r["q_aln"]}\n'
-                     f'          {r["bar"]}\n'
-                     f'결과 서열 {r["r_aln"]}\n')
+            lines[0]["cells"].append((f'   판정: {r["verdict"]}  |  방향: {r["strand"]}  |  위치: {r["start"]}-{r["end"]}', ""))
+            aln, _ = build_lines(r, self.last_query, r["read"], self.last_query_name, f.name,
+                                 self.frame_var.get())
+            lines += aln
             if r.get("diff_notes"):
-                text += "차이: " + "; ".join(r["diff_notes"]) + "\n"
+                lines.append(self._plain("DNA 차이: " + "; ".join(r["diff_notes"]), "mmtext"))
             elif r["diffs"]:
-                text += "차이: " + ", ".join(r["diffs"]) + "\n"
+                lines.append(self._plain("DNA 차이: " + ", ".join(r["diffs"]), "mmtext"))
         else:
-            text += f'찾을 서열이 없습니다 (가장 비슷한 곳도 {r["diff"]}개 차이)\n'
+            lines.append(self._plain(f'찾을 서열이 없습니다 (가장 비슷한 곳도 {r["diff"]}개 차이)', "mmtext"))
         q = r.get("qual")
         if q:
-            text += (f'전체 품질: {q["grade"]} | 깨끗한 구간(Q20 기준) {q["clean"][0] if q["clean"] else "-"}'
-                     f'-{q["clean"][1] if q["clean"] else "-"} ({q["clean_len"]} bp, 평균 Q{q["clean_meanq"]}) | {q["note"]}\n')
+            lines.append(self._plain(
+                f'전체 품질: {q["grade"]} | 깨끗한 구간(Q20 기준) {q["clean"][0] if q["clean"] else "-"}'
+                f'-{q["clean"][1] if q["clean"] else "-"} ({q["clean_len"]} bp, 평균 Q{q["clean_meanq"]}) | {q["note"]}'))
             if found and r["site"]["mixed"]:
-                text += "찾은 부위 이중 피크: " + ", ".join(
-                    f"{p}번 {b}/{b2} {int(x * 100)}%" for p, b, b2, x in r["site"]["mixed"]) + "\n"
+                lines.append(self._plain("찾은 부위 이중 피크: " + ", ".join(
+                    f"{p}번 {b}/{b2} {int(x * 100)}%" for p, b, b2, x in r["site"]["mixed"]), "mmtext"))
         else:
-            text += "(텍스트 파일이라 크로마토그램 품질은 분석하지 않았습니다. .ab1 파일을 넣으면 함께 분석합니다.)\n"
-        self._set_detail(text)
+            lines.append(self._plain("(텍스트 파일이라 크로마토그램 품질은 분석하지 않았습니다. "
+                                     ".ab1 파일을 넣으면 함께 분석합니다.)", "note"))
+        self._render_detail(lines)
 
         tr = r.get("trace")
         if tr is not None:
             self.draw_overview(tr, q, r if found else None)
             if found:
                 self.draw_chromatogram(tr, r)
+
+    def _setup_detail_tags(self, mono):
+        """상세 영역 글자 스타일: 찾을 서열 = 파랑, 결과 서열 = 초록, 불일치 = 빨간 바탕 흰 글자"""
+        d = self.detail
+        mono_bold = (mono[0], mono[1], "bold")
+        self.label_font = tkfont.Font(family="Malgun Gothic", size=9, weight="bold")
+        d.tag_configure("q", foreground="#174ea6", background="#e8f0fe")
+        d.tag_configure("r", foreground="#137333", background="#e6f4ea")
+        d.tag_configure("mm", foreground="white", background="#d93025", font=mono_bold)
+        d.tag_configure("bar", foreground="#9aa0a6")
+        d.tag_configure("mark", foreground="#d93025", font=mono_bold)
+        d.tag_configure("num", foreground="#80868b")
+        d.tag_configure("head", font=self.label_font)
+        d.tag_configure("note", foreground="#5f6368")
+        d.tag_configure("mmtext", foreground="#d93025")
+        d.tag_configure("oktext", foreground="#137333")
+        d.tag_configure("label_q", foreground="#174ea6", font=self.label_font)
+        d.tag_configure("label_r", foreground="#137333", font=self.label_font)
+
+    @staticmethod
+    def _plain(text, tag=""):
+        """정렬 칸 없이 왼쪽부터 쓰는 줄"""
+        return {"plain": True, "cells": [(text, tag)]}
+
+    def _render_detail(self, lines):
+        """
+        줄 목록을 상세 영역에 출력. 정렬 줄은 '파일 이름 [탭] 서열' 형태로,
+        탭 위치를 가장 긴 파일 이름에 맞춰서 서열 시작 위치가 모두 같게 함
+        """
+        labels = [l["label"] for l in lines if not l.get("plain") and l.get("label")]
+        tab = max([self.label_font.measure(t) for t in labels] or [0]) + 16
+        d = self.detail
+        d.configure(state="normal", tabs=(tab,))
+        d.delete("1.0", "end")
+        for l in lines:
+            if not l.get("plain"):
+                if l.get("label"):
+                    d.insert("end", l["label"], ("label_" + l.get("label_tag", "q"),))
+                d.insert("end", "\t")
+            for text, tag in l["cells"]:
+                d.insert("end", text, (tag,) if tag else ())
+            d.insert("end", "\n")
+        d.configure(state="disabled")
 
     def _set_detail(self, text):
         self.detail.configure(state="normal")
@@ -382,19 +457,28 @@ class App(tk.Tk):
             return
         with open(path, "w", newline="", encoding="utf-8-sig") as fp:   # 엑셀에서 한글 안 깨지게
             w = csv.writer(fp)
-            w.writerow(["찾을서열", "파일", "판정", "차이개수", "방향", "시작", "끝", "차이상세",
+            frame, _ = frame_note(self.last_query, self.frame_var.get())
+            w.writerow(["찾을서열파일", "찾을서열", "파일", "판정", "차이개수", "방향", "시작", "끝", "차이상세",
                         "찾은부위품질", "깨끗한구간시작", "깨끗한구간끝", "깨끗한구간길이",
-                        "깨끗한구간평균Q", "전체품질", "품질설명"])
+                        "깨끗한구간평균Q", "전체품질", "품질설명", "읽는틀", "아미노산비교"])
             for f, r in self.results.items():
                 if r["verdict"] == "오류":
-                    w.writerow([self.last_query, f.name, "오류"] + [""] * 4 + [r["error"]] + [""] * 7)
+                    w.writerow([self.last_query_name, self.last_query, f.name, "오류"] + [""] * 4
+                               + [r["error"]] + [""] * 9)
                     continue
                 q = r.get("qual") or {}
                 clean = q.get("clean") or ("", "")
-                w.writerow([self.last_query, f.name, r["verdict"], r["diff"], r["strand"],
+                aa_text = ""
+                if r["verdict"] != "없음":
+                    aa = aa_compare(self.last_query, r["read"], r, frame)
+                    aa_text = ("일치" if not aa["diffs"] else
+                               ", ".join(f"{k}번 {a}→{b}" for k, a, b, _, _ in aa["diffs"])
+                               + (" (프레임시프트)" if aa["frameshift"] else ""))
+                w.writerow([self.last_query_name, self.last_query, f.name, r["verdict"], r["diff"], r["strand"],
                             r["start"], r["end"], "; ".join(r.get("diff_notes") or r["diffs"]),
                             r.get("site_label", ""), clean[0], clean[1], q.get("clean_len", ""),
-                            q.get("clean_meanq", ""), q.get("grade", ""), q.get("note", "")])
+                            q.get("clean_meanq", ""), q.get("grade", ""), q.get("note", ""),
+                            frame if aa_text else "", aa_text])
         self.status_var.set(f"저장 완료: {Path(path).name}")
 
     def save_selected_image(self):
@@ -409,7 +493,7 @@ class App(tk.Tk):
         if not path:
             return
         try:
-            img = render_report(f, self.results[f], self.last_query)
+            img = render_report(f, self.results[f], self.last_query, self.last_query_name, self.frame_var.get())
             img.save(path, quality=95) if path.lower().endswith((".jpg", ".jpeg")) else img.save(path)
         except Exception as e:
             messagebox.showerror("저장 실패", f"{type(e).__name__}: {e}")
@@ -421,22 +505,115 @@ class App(tk.Tk):
         if not folder:
             return
         folder = Path(folder)
-        targets = [folder / "00_summary.png"] + [folder / f"{f.stem}_result.png" for f in self.results]
+        targets = ([folder / "00_summary.png", folder / "00_overview.png"]
+                   + [folder / f"{f.stem}_result.png" for f in self.results])
         exists = [p.name for p in targets if p.exists()]
         if exists and not messagebox.askyesno(
                 "덮어쓰기 확인", f"이미 있는 파일 {len(exists)}개를 덮어씁니다:\n" + "\n".join(exists[:8])
                 + ("\n..." if len(exists) > 8 else "") + "\n\n계속할까요?"):
             return
         try:
-            render_summary(self.results, self.last_query).save(targets[0])
-            for f, out in zip(self.results, targets[1:]):
-                render_report(f, self.results[f], self.last_query).save(out)
+            render_summary(self.results, self.last_query, self.last_query_name).save(targets[0])
+            render_overview(self.results, self.last_query, self.last_query_name,
+                            self.frame_var.get()).save(targets[1])
+            for f, out in zip(self.results, targets[2:]):
+                render_report(f, self.results[f], self.last_query, self.last_query_name,
+                              self.frame_var.get()).save(out)
                 self.status_var.set(f"이미지 저장 중... {out.name}")
                 self.update_idletasks()
         except Exception as e:
             messagebox.showerror("저장 실패", f"{type(e).__name__}: {e}")
             return
         self.status_var.set(f"이미지 {len(targets)}개 저장 완료: {folder}")
+
+    # ---------- 모아보기 ----------
+    def open_overview(self):
+        """모든 결과를 한 화면에 모아서 보여주는 창 (PNG / PDF 로 내보내기)"""
+        if not self.results:
+            return
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            img = render_overview(self.results, self.last_query, self.last_query_name, self.frame_var.get())
+        finally:
+            self.config(cursor="")
+        OverviewWindow(self, img)
+
+    def save_pdf(self, parent=None):
+        path = filedialog.asksaveasfilename(parent=parent or self, title="PDF로 저장", defaultextension=".pdf",
+                                            initialfile="sequencing_report.pdf",
+                                            filetypes=[("PDF 파일", "*.pdf")])
+        if not path:
+            return
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            export_pdf(path, self.results, self.last_query, self.last_query_name, self.frame_var.get())
+        except Exception as e:
+            messagebox.showerror("저장 실패", f"{type(e).__name__}: {e}", parent=parent or self)
+            return
+        finally:
+            self.config(cursor="")
+        self.status_var.set(f"PDF 저장 완료: {Path(path).name} (모아보기 1쪽 + 파일별 {len(self.results)}쪽)")
+
+
+class OverviewWindow(tk.Toplevel):
+    """모아보기 이미지를 스크롤해서 보는 창"""
+    ZOOMS = {"화면 맞춤": None, "50%": 0.5, "75%": 0.75, "100%": 1.0}
+
+    def __init__(self, app, img):
+        super().__init__(app)
+        self.app, self.img = app, img
+        self.title("결과 모아보기")
+        self.geometry("1200x860")
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=8, pady=6)
+        ttk.Label(bar, text="확대").pack(side="left")
+        self.zoom_var = tk.StringVar(value="화면 맞춤")
+        zoom = ttk.Combobox(bar, textvariable=self.zoom_var, values=list(self.ZOOMS), width=9, state="readonly")
+        zoom.pack(side="left", padx=(4, 16))
+        zoom.bind("<<ComboboxSelected>>", lambda e: self.redraw())
+        ttk.Button(bar, text="PNG로 저장", command=self.save_png).pack(side="left", padx=4)
+        ttk.Button(bar, text="PDF로 저장 (모아보기 + 파일별 상세)",
+                   command=lambda: app.save_pdf(self)).pack(side="left", padx=4)
+        ttk.Label(bar, text="마우스 휠로 스크롤").pack(side="right")
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.canvas = tk.Canvas(frame, background="white", highlightthickness=0)
+        ys = ttk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
+        xs = ttk.Scrollbar(frame, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        ys.pack(side="right", fill="y")
+        xs.pack(side="bottom", fill="x")
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(int(-e.delta / 120) * 3, "units"))
+        self.bind("<Configure>", lambda e: self.after_idle(self.redraw) if e.widget is self else None)
+        self._last = None
+        self.after(50, self.redraw)
+
+    def redraw(self):
+        self.update_idletasks()
+        z = self.ZOOMS[self.zoom_var.get()]
+        if z is None:   # 화면 맞춤: 창 폭에 맞춤
+            z = max(0.3, (self.canvas.winfo_width() - 4) / self.img.width)
+        key = round(z, 3)
+        if key == self._last:
+            return
+        self._last = key
+        w, h = int(self.img.width * z), int(self.img.height * z)
+        self.photo = ImageTk.PhotoImage(self.img.resize((w, h)))
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
+        self.canvas.configure(scrollregion=(0, 0, w, h))
+
+    def save_png(self):
+        path = filedialog.asksaveasfilename(parent=self, title="모아보기 이미지 저장", defaultextension=".png",
+                                            initialfile="00_overview.png",
+                                            filetypes=[("PNG 이미지", "*.png"), ("JPEG 이미지", "*.jpg")])
+        if path:
+            self.img.save(path, quality=95) if path.lower().endswith((".jpg", ".jpeg")) else self.img.save(path)
+            self.app.status_var.set(f"모아보기 이미지 저장 완료: {Path(path).name}")
 
 
 if __name__ == "__main__":
